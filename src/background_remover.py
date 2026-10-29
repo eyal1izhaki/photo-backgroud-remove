@@ -1,4 +1,5 @@
 import argparse
+import functools
 import os
 import time
 from pathlib import Path
@@ -6,8 +7,8 @@ import cv2
 import numpy as np
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver as Observer
-from rembg import remove
-from PIL import Image, UnidentifiedImageError
+from rembg import new_session, remove
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # --- Configuration ---
 # Defaults keep everything inside the repo (dev); master-launch.ahk passes the real camera folders.
@@ -15,6 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "tests" / "fixtures" / "canon-pics"
 DEST_DIR = ROOT / "out"
 os.environ.setdefault("U2NET_HOME", str(ROOT / ".u2net"))  # rembg model cache, otherwise ~/.u2net
+COIN_MODEL = "u2net" # Cuts coins cleanly, but can miss parts of a slab's clear plastic
+SLAB_MODEL = "isnet-general-use" # Traces slab outlines completely, but can keep bits of the holder around a coin
 SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.webp'}
 IGNORE_PREFIX = "IMG" # Files starting with this will be ignored
 ALPHA_THRESHOLD = 32 # Mask alpha at or below this is noise (reflections, shadows); raise it if ghosts remain
@@ -62,6 +65,12 @@ def compose(cutout: Image.Image):
     kind = "slab" if cv2.contourArea(largest) / (rect_width * rect_height) > SLAB_FILL_RATIO else "coin"
 
     if kind == "slab":
+        # The model is often unsure about clear plastic and leaves slabs patchy or washed out; a slab is solid,
+        # so make everything inside its outline opaque
+        solid = np.zeros_like(mask)
+        cv2.drawContours(solid, [cv2.convexHull(largest)], -1, 255, cv2.FILLED)
+        cutout.putalpha(Image.fromarray(solid))
+
         # Straighten by the smallest rotation that makes the slab's edges upright
         tilt = (angle + 45) % 90 - 45
         cutout = cutout.rotate(tilt, Image.Resampling.BICUBIC, expand=True)
@@ -89,6 +98,20 @@ def compose(cutout: Image.Image):
     return background, kind
 
 
+@functools.cache
+def rembg_session(model: str):
+    """Loads each model once; remove() without a session reloads it for every image."""
+    return new_session(model)
+
+
+def cut_out(photo: Image.Image, model: str) -> Image.Image:
+    """The photo with the model's background mask as alpha. Colors stay the photo's own (rembg's cutout
+    darkens every pixel the model is unsure about toward black)."""
+    cutout = photo.convert("RGBA")
+    cutout.putalpha(remove(photo, session=rembg_session(model), only_mask=True))
+    return cutout
+
+
 def process_image(src_path: Path, dest_dir: Path):
     """Removes background, centers the object on a white canvas (see compose), and saves."""
     dest_path = dest_dir / src_path.name
@@ -102,19 +125,20 @@ def process_image(src_path: Path, dest_dir: Path):
     print(f"Processing: {src_path.name}...")
     
     try:
-        input_image = Image.open(src_path)
-        
-        # 2. Remove background (returns an RGBA image with transparent padding)
-        output_image = remove(input_image)
+        # Upright per the camera's EXIF orientation, as rembg does internally, so the mask lines up
+        input_image = ImageOps.exif_transpose(Image.open(src_path)).convert("RGB")
 
-        # 3. Center it on a white canvas shaped for its kind
-        composed = compose(output_image)
+        # 2. Remove background and center it on a white canvas shaped for its kind; slabs are redone
+        #    with the model that traces their outline completely
+        composed = compose(cut_out(input_image, COIN_MODEL))
+        if composed and composed[1] == "slab":
+            composed = compose(cut_out(input_image, SLAB_MODEL))
         if not composed:
             print(f"Warning: {src_path.name} appears to be completely transparent.")
             return
         background, kind = composed
 
-        # 4. Save final image
+        # 3. Save final image
         background.save(final_dest_path, format="JPEG", quality=95)  # Pillow's default of 75 shows artifacts on coin edges
         print(f"Successfully saved: {final_dest_path.name} ({kind})")
         

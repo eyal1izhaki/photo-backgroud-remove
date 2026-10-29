@@ -43,5 +43,10 @@ content = tilted.convert("L").crop(bbox).point(lambda v: 255 if v < 250 else 0)
 fill = content.histogram()[255] / (content.width * content.height)
 assert fill > 0.98 and tilted.width < tilted.height, (fill, tilted.size)
 
+# A slab the model was unsure about (semi-transparent) comes out solid, not washed out by the white behind it
+faint, kind = compose(cutout(lambda d, box: d.rounded_rectangle(box, 40, fill=(90, 90, 90, 120)), (1000, 1400)))
+center = faint.getpixel((faint.width // 2, faint.height // 2))
+assert kind == "slab" and center == (90, 90, 90), (kind, center)
+
 assert compose(Image.new("RGBA", (100, 100), (0, 0, 0, 0))) is None
 print("ok")
