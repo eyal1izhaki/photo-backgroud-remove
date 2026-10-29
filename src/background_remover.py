@@ -22,6 +22,10 @@ SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.webp'}
 IGNORE_PREFIX = "IMG" # Files starting with this will be ignored
 ALPHA_THRESHOLD = 32 # Mask alpha at or below this is noise (reflections, shadows); raise it if ghosts remain
 SLAB_FILL_RATIO = 0.83 # Objects covering more of their tightest rotated rectangle than this are slabs; round coins cover pi/4 (0.79)
+SLAB_EDGE_ALPHA = 200 # Slab outline is traced above this; the shadow a slab casts on the backdrop stays below (fixtures: shadow up to ~175, slab 240+)
+MAX_TILT = 10 # Degrees; slabs are only ever slightly off when photographed (fixtures: up to 1.8), more means a misread outline
+SLAB_EDGE_SEARCH = (0.01, 0.08) # Share of the slab's size searched outside / inside the model's outline for its real edge (fixtures: shadows up to ~0.06)
+SLAB_TEXTURE = 2 # A side's real edge is where texture rises past this many times the backdrop's (fixtures: backdrop/shadow ~1, slab plastic 2.4+)
 CANVAS_SIZE = 1500
 PADDING = int(CANVAS_SIZE * 0.05) # Object fills 90% of the canvas: 75px of white on every side
 
@@ -48,6 +52,35 @@ from PIL import Image, UnidentifiedImageError
 from rembg import remove
 
 
+def find_slab_edges(gray: np.ndarray, outline: np.ndarray):
+    """(top, bottom, left, right) where an upright slab really starts. Slab plastic is textured (frosted, ridged)
+    while the backdrop and the slab's shadow on it are smooth, however dark or crisp the shadow's edge, so each side
+    starts where texture does along the middle of that side. Falls back to the model's outline per side."""
+    ys, xs = np.nonzero(outline)
+    top, bottom, left, right = ys.min(), ys.max(), xs.min(), xs.max()
+    size = min(bottom - top, right - left)
+    outward, inward = (int(share * size) for share in SLAB_EDGE_SEARCH)
+
+    def side_start(lines, start):
+        """lines: one row per scanline across the side, running from outside the slab inward."""
+        lo = max(start - outward, 0)
+        band = lines[:, lo:start + inward].astype(np.float32)
+        # Texture at each depth: how much pixels stray from their neighbors along the side, typical over the side
+        texture = np.median(np.abs(band - cv2.blur(band, (1, 9))), axis=0)
+        texture = np.convolve(texture, np.ones(5) / 5, mode="same")
+        backdrop = np.median(texture[:max(start - lo, 1)])
+        rough = np.nonzero(texture > SLAB_TEXTURE * backdrop)[0]
+        return lo + rough[0] if len(rough) else start
+
+    height, width = gray.shape
+    along_x = slice(left + (right - left) // 5, right - (right - left) // 5)
+    along_y = slice(top + (bottom - top) // 5, bottom - (bottom - top) // 5)
+    return (side_start(gray[:, along_x].T, top),
+            height - 1 - side_start(gray[::-1, along_x].T, height - 1 - bottom),
+            side_start(gray[along_y, :], left),
+            width - 1 - side_start(gray[along_y, ::-1], width - 1 - right))
+
+
 def compose(cutout: Image.Image):
     """Centers a background-removed RGBA image on white: round coins on a square canvas, slabs straightened
     on a canvas shaped like the slab. Returns (image, "coin" | "slab"), or None if the cutout is empty."""
@@ -65,15 +98,35 @@ def compose(cutout: Image.Image):
     kind = "slab" if cv2.contourArea(largest) / (rect_width * rect_height) > SLAB_FILL_RATIO else "coin"
 
     if kind == "slab":
+        # The slab's shadow on the backdrop comes through as a soft, half-confident band that would make its
+        # edges look crooked; the model is confident only about the slab itself, so trace the outline from that
+        edges, _ = cv2.findContours((np.array(alpha) > SLAB_EDGE_ALPHA).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if edges:
+            largest = max(edges, key=cv2.contourArea)
+            angle = cv2.minAreaRect(largest)[2]
+
         # The model is often unsure about clear plastic and leaves slabs patchy or washed out; a slab is solid,
         # so make everything inside its outline opaque
         solid = np.zeros_like(mask)
         cv2.drawContours(solid, [cv2.convexHull(largest)], -1, 255, cv2.FILLED)
         cutout.putalpha(Image.fromarray(solid))
 
-        # Straighten by the smallest rotation that makes the slab's edges upright
+        # Straighten by the smallest rotation that makes the slab's edges upright. Only small corrections:
+        # a bigger angle means the outline was misread, and rotating would tip the slab over, so leave it
         tilt = (angle + 45) % 90 - 45
-        cutout = cutout.rotate(tilt, Image.Resampling.BICUBIC, expand=True)
+        if abs(tilt) <= MAX_TILT:
+            # Fill the corners rotation exposes with the backdrop, so they don't read as an edge below
+            rgb = np.array(cutout)
+            backdrop = np.median(np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]]), axis=0).astype(int)
+            cutout = cutout.rotate(tilt, Image.Resampling.BICUBIC, expand=True, fillcolor=(*backdrop[:3], 0))
+
+            # Even a confident outline can include the slab's shadow: cut each straight side back to where the
+            # slab really starts, keeping the model's rounded corners
+            alpha = np.array(cutout.getchannel("A"))
+            top, bottom, left, right = find_slab_edges(np.array(cutout.convert("L")), alpha > 127)
+            sides = np.zeros_like(alpha)
+            sides[top:bottom + 1, left:right + 1] = alpha[top:bottom + 1, left:right + 1]
+            cutout.putalpha(Image.fromarray(sides))
 
     trimmed_image = cutout.crop(cutout.getchannel("A").getbbox())
     width, height = trimmed_image.size
