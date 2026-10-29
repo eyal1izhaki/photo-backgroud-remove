@@ -1,0 +1,3 @@
+rembg[cpu]
+watchdog
+pillow

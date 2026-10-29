@@ -1,0 +1,7 @@
+tests/fixtures/
+*.zip
+.DS_Store
+__pycache__/
+.venv/
+out/
+.u2net/
