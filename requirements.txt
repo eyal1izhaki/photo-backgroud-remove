@@ -1,3 +1,5 @@
 rembg[cpu]
 watchdog
 pillow
+numpy
+opencv-python-headless

@@ -2,6 +2,8 @@ import argparse
 import os
 import time
 from pathlib import Path
+import cv2
+import numpy as np
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver as Observer
 from rembg import remove
@@ -16,6 +18,9 @@ os.environ.setdefault("U2NET_HOME", str(ROOT / ".u2net"))  # rembg model cache, 
 SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.webp'}
 IGNORE_PREFIX = "IMG" # Files starting with this will be ignored
 ALPHA_THRESHOLD = 32 # Mask alpha at or below this is noise (reflections, shadows); raise it if ghosts remain
+SLAB_FILL_RATIO = 0.83 # Objects covering more of their tightest rotated rectangle than this are slabs; round coins cover pi/4 (0.79)
+CANVAS_SIZE = 1500
+PADDING = int(CANVAS_SIZE * 0.05) # Object fills 90% of the canvas: 75px of white on every side
 
 def is_valid_file(file_path: Path) -> bool:
     """Checks if the file is a supported image and doesn't trigger the ignore prefix."""
@@ -40,8 +45,52 @@ from PIL import Image, UnidentifiedImageError
 from rembg import remove
 
 
+def compose(cutout: Image.Image):
+    """Centers a background-removed RGBA image on white: round coins on a square canvas, slabs straightened
+    on a canvas shaped like the slab. Returns (image, "coin" | "slab"), or None if the cutout is empty."""
+    # Drop faint mask noise so it neither shows as a ghost nor stretches the crop off-center
+    alpha = cutout.getchannel("A").point(lambda a: a if a > ALPHA_THRESHOLD else 0)
+    cutout.putalpha(alpha)
+    if not alpha.getbbox():
+        return None
+
+    # Slabs (rated coins) fill nearly all of their tightest rotated rectangle, round coins only pi/4 of it
+    mask = (np.array(alpha) > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest = max(contours, key=cv2.contourArea)
+    _, (rect_width, rect_height), angle = cv2.minAreaRect(largest)
+    kind = "slab" if cv2.contourArea(largest) / (rect_width * rect_height) > SLAB_FILL_RATIO else "coin"
+
+    if kind == "slab":
+        # Straighten by the smallest rotation that makes the slab's edges upright
+        tilt = (angle + 45) % 90 - 45
+        cutout = cutout.rotate(tilt, Image.Resampling.BICUBIC, expand=True)
+
+    trimmed_image = cutout.crop(cutout.getchannel("A").getbbox())
+    width, height = trimmed_image.size
+
+    # Resize proportionally so the longest side spans 90% of the canvas
+    scale = (CANVAS_SIZE - 2 * PADDING) / max(width, height)
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+    resized_object = trimmed_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+    # Coins get a square canvas; slabs get one with the same padding on every side
+    if kind == "slab":
+        canvas = (new_width + 2 * PADDING, new_height + 2 * PADDING)
+    else:
+        canvas = (CANVAS_SIZE, CANVAS_SIZE)
+    background = Image.new("RGB", canvas, (255, 255, 255))
+
+    # Paste the object in the center using its alpha channel as a mask
+    paste_x = (canvas[0] - new_width) // 2
+    paste_y = (canvas[1] - new_height) // 2
+    background.paste(resized_object, (paste_x, paste_y), resized_object)
+    return background, kind
+
+
 def process_image(src_path: Path, dest_dir: Path):
-    """Removes background, trims transparent padding, scales the coin to 80% of a 1500x1500 white canvas, and saves."""
+    """Removes background, centers the object on a white canvas (see compose), and saves."""
     dest_path = dest_dir / src_path.name
     final_dest_path = dest_path.with_suffix('.jpg')
 
@@ -57,43 +106,17 @@ def process_image(src_path: Path, dest_dir: Path):
         
         # 2. Remove background (returns an RGBA image with transparent padding)
         output_image = remove(input_image)
-        
-        # 3. Drop faint mask noise so it neither shows as a ghost nor stretches the crop off-center,
-        #    then crop to the actual coin
-        alpha = output_image.getchannel("A").point(lambda a: a if a > ALPHA_THRESHOLD else 0)
-        output_image.putalpha(alpha)
-        bbox = alpha.getbbox()
-        if not bbox:
+
+        # 3. Center it on a white canvas shaped for its kind
+        composed = compose(output_image)
+        if not composed:
             print(f"Warning: {src_path.name} appears to be completely transparent.")
             return
-        
-        trimmed_image = output_image.crop(bbox)
-        
-        # 4. Setup canvas dimensions and target object size (80% of 1500 = 1200px)
-        canvas_size = 1500
-        max_object_size = int(canvas_size * 0.9)
-        
-        # 5. Resize the trimmed coin proportionally to fit within 1200x1200
-        orig_width, orig_height = trimmed_image.size
-        scale = min(max_object_size / orig_width, max_object_size / orig_height)
-        new_width = int(orig_width * scale)
-        new_height = int(orig_height * scale)
-        
-        resized_object = trimmed_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        # 6. Create a clean 1500x1500 white background (RGB)
-        background = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
-        
-        # 7. Calculate coordinates to paste the coin right in the center
-        paste_x = (canvas_size - new_width) // 2
-        paste_y = (canvas_size - new_height) // 2
-        
-        # 8. Paste the resized coin onto the white background using its alpha channel as a mask
-        background.paste(resized_object, (paste_x, paste_y), resized_object)
-        
-        # 9. Save final image
+        background, kind = composed
+
+        # 4. Save final image
         background.save(final_dest_path, format="JPEG", quality=95)  # Pillow's default of 75 shows artifacts on coin edges
-        print(f"Successfully saved: {final_dest_path.name}")
+        print(f"Successfully saved: {final_dest_path.name} ({kind})")
         
     except UnidentifiedImageError:
         print(f"Error: {src_path.name} is not a valid image file.")
