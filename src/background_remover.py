@@ -42,7 +42,7 @@ from rembg import remove
 def process_image(src_path: Path, dest_dir: Path):
     """Removes background, trims transparent padding, scales the coin to 80% of a 1500x1500 white canvas, and saves."""
     dest_path = dest_dir / src_path.name
-    final_dest_path = dest_path.with_suffix('.png')
+    final_dest_path = dest_path.with_suffix('.jpg')
 
     # 1. Check if the file already exists in the destination
     if final_dest_path.exists():
@@ -88,7 +88,7 @@ def process_image(src_path: Path, dest_dir: Path):
         background.paste(resized_object, (paste_x, paste_y), resized_object)
         
         # 9. Save final image
-        background.save(final_dest_path, format="PNG")
+        background.save(final_dest_path, format="JPEG", quality=95)  # Pillow's default of 75 shows artifacts on coin edges
         print(f"Successfully saved: {final_dest_path.name}")
         
     except UnidentifiedImageError:
