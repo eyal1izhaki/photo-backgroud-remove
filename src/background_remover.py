@@ -15,6 +15,7 @@ DEST_DIR = ROOT / "out"
 os.environ.setdefault("U2NET_HOME", str(ROOT / ".u2net"))  # rembg model cache, otherwise ~/.u2net
 SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.webp'}
 IGNORE_PREFIX = "IMG" # Files starting with this will be ignored
+ALPHA_THRESHOLD = 32 # Mask alpha at or below this is noise (reflections, shadows); raise it if ghosts remain
 
 def is_valid_file(file_path: Path) -> bool:
     """Checks if the file is a supported image and doesn't trigger the ignore prefix."""
@@ -57,8 +58,11 @@ def process_image(src_path: Path, dest_dir: Path):
         # 2. Remove background (returns an RGBA image with transparent padding)
         output_image = remove(input_image)
         
-        # 3. Crop out all surrounding transparent pixels to isolate the actual coin
-        bbox = output_image.getbbox()
+        # 3. Drop faint mask noise so it neither shows as a ghost nor stretches the crop off-center,
+        #    then crop to the actual coin
+        alpha = output_image.getchannel("A").point(lambda a: a if a > ALPHA_THRESHOLD else 0)
+        output_image.putalpha(alpha)
+        bbox = alpha.getbbox()
         if not bbox:
             print(f"Warning: {src_path.name} appears to be completely transparent.")
             return
