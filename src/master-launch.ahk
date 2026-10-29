@@ -9,7 +9,7 @@ PythonScriptPath := A_ScriptDir "\background_remover.py"
 EOSUtilityPath   := "C:\Program Files (x86)\Canon\EOS Utility\EOS Utility 2.exe" 
 WorkerScriptPath := A_ScriptDir "\photo-shooting-shortcuts.ahk"
 SrcDir           := EnvGet("USERPROFILE") "\Pictures\canon-pics"
-DestDir          := EnvGet("USERPROFILE") "\Pictures\canon-pics-proccessed"
+DestDir          := EnvGet("USERPROFILE") "\Pictures\canon-pics-processed"
 
 
 global PythonPID := 0
